@@ -1,0 +1,16 @@
+# Core (server, wire protocol, physics, examples) -- required
+numpy<2            # aotools 1.0.7 and the code assume numpy 1.x
+scipy              # pulled in by aotools
+aotools==1.0.7     # FFT phase-screen generator + structure-function references
+pyzmq              # streaming (PUB/SUB) + control (REQ/REP)
+
+# Optional -- control/telemetry GUI (fso_twin/control_gui.py)
+#   pip install PyQt5 pyqtgraph
+
+# Optional -- plotting in examples / validation
+#   pip install matplotlib
+
+# NOT pip-installable -- the GNU Radio integration (gnuradio/) needs a system
+# install of GNU Radio 3.8+ (e.g. apt install gnuradio). It is only required if
+# you use the embedded channel block; the server, protocol and physics do not
+# depend on it.

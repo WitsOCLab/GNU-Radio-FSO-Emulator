@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# run artefacts
+*.csv
+*.cf32
+*.npz
+!validation/strong_sweep.json
+out.*
+fso_record*.csv
+predictor_log.csv
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
