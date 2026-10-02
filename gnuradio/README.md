@@ -12,6 +12,18 @@ upsamples the slow gain to the signal rate by **linear interpolation**, and
 never blocks the scheduler. Every dropped message, loop seam, or buffer
 starvation is counted and printed when the flowgraph stops.
 
+Latency is bounded: if more than 4 x the server lookahead (1 s) of gain is ever
+buffered, the oldest samples are dropped as a counted, logged **resync**. The
+shutdown summary reports gaps, lost samples, loops, starvation (start-up vs
+in-run, plus the longest in-run episode), resyncs, and max/mean delivery
+latency. Optional logs, enabled by environment variable:
+
+| Variable | Contents |
+|---|---|
+| `FSO_EVENT_LOG=path.csv` | every gap / resync / epoch reset: wall time, absolute gain-index range, count |
+| `FSO_INDEX_LOG=path.csv` | the gain index applied at each frame boundary (`FSO_FRAME_LEN` signal samples, default 33792), for index-exact alignment of frames with the server's fade log |
+| `FSO_DIAG_LOG=path.csv` | decoder state at ~10 Hz (diagnostics) |
+
 ## Use it in GNU Radio Companion
 
 1. Add a **Python Block** to your flowgraph and set its source to the contents

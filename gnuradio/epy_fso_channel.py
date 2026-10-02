@@ -44,6 +44,7 @@ Environment: GNU Radio 3.8+, numpy < 2, pyzmq. The wire protocol is an inline
 copy of fso_twin/fso_stream_proto.py (kept identical so a bare GRC paste works).
 """
 
+import os
 import struct
 import time
 
@@ -83,6 +84,20 @@ except ImportError:                                   # inline fallback
                 "looped": bool(flags & FLAG_LOOPED),
                 "epoch": epoch, "seq_start": seq_start,
                 "f_update": f_update, "n": n, "gains": gains}
+
+
+# Bounded latency: the server publishes LOOKAHEAD_S ahead of real time. If the
+# buffered-ahead gain ever exceeds RESYNC_FACTOR x that, the oldest samples are
+# dropped back to LOOKAHEAD_S as a counted, logged RESYNC (never silently).
+LOOKAHEAD_S = 0.25
+RESYNC_FACTOR = 4.0
+# NOTE on in-run "starvation": the server's lookahead is published before a
+# subscriber joins, and a throttle-paced flowgraph catches up after its start-up
+# stall, so the block normally runs AT the live edge and defers each call until
+# the next 20 ms publish tick arrives. That is pacing, not data loss (no value
+# is ever held). The longest continuous in-run starvation episode is reported
+# so that a genuine stall (>> one publish tick) can be told apart from it.
+FRAME_LEN = int(os.environ.get("FSO_FRAME_LEN", "33792"))  # signal samples/frame
 
 
 class GainStreamDecoder:
@@ -125,6 +140,85 @@ class GainStreamDecoder:
         self._warn_period_s = warn_period_s
         self._last_warn = {}
 
+        # DIAGNOSTIC instrumentation (opt-in, no effect on the signal path):
+        # set FSO_DIAG_LOG=/path.csv to log decoder state at ~10 Hz.
+        self.n_signal_out = 0             # signal samples produced (cumulative)
+        self.latest_seq = -1              # last gain index received
+        self.n_starve_pre_first = 0       # starve events before 1st message
+        self.t_first_msg = None
+        self.t_first_starve = None
+        self.t_last_starve = None
+        self._diag = None
+        self._diag_last = 0.0
+
+        # Bounded-latency bookkeeping + exact index ground truth.
+        self._started = False             # first successful produce() done
+        self.n_starve_startup = 0         # starve events before it
+        self.n_starve_inrun = 0           # starve events after it
+        self.n_resync = 0                 # resync events (oldest samples dropped)
+        self.n_resync_samples = 0         # gain samples dropped by resyncs
+        self.lat_max_s = 0.0              # delivery latency (buffered-ahead s)
+        self._ep_start = None             # current in-run starvation episode
+        self.starve_max_episode_s = 0.0   # longest one (pacing vs real stall)
+        self._lat_sum = 0.0
+        self._lat_n = 0
+        ev = os.environ.get("FSO_EVENT_LOG")
+        self._events = open(ev, "w", buffering=1) if ev else None
+        if self._events:
+            self._events.write("wall_time_s,event,first_index,last_index,"
+                               "n_samples,phase\n")
+        ix = os.environ.get("FSO_INDEX_LOG")
+        self._index = open(ix, "w", buffering=1 << 16) if ix else None
+        if self._index:
+            # one row per FRAME_LEN-sample frame boundary of the signal stream
+            # through this block: frame k starts at signal sample k*FRAME_LEN,
+            # where the applied gain index (fractional) was gain_index
+            self._index.write("frame,gain_index,f_update,wall_time_s\n")
+        path = os.environ.get("FSO_DIAG_LOG")
+        if path:
+            self._diag = open(path, "w", buffering=1)
+            self._diag.write("wall_time_s,buf_size,base_index,cursor,"
+                             "latest_seq,f_update,n_signal_out,"
+                             "starve_events,starve_pre_first,messages\n")
+
+    def _diag_tick(self):
+        if self._diag is None:
+            return
+        now = time.time()
+        if now - self._diag_last < 0.1:
+            return
+        self._diag_last = now
+        self._diag.write("%.6f,%d,%d,%.6f,%d,%.6f,%d,%d,%d,%d\n" % (
+            now, self.buf.size, self.base_index, self.cursor,
+            self.latest_seq, self.f_update or 0.0, self.n_signal_out,
+            self.n_starve_events, self.n_starve_pre_first, self.n_messages))
+
+    def _event(self, kind, first, last, n):
+        """Every discarded/skipped/resynchronised gain sample is logged here
+        with wall time and absolute index range (always printed; also to
+        FSO_EVENT_LOG if set)."""
+        now = time.time()
+        phase = "in-run" if self._started else "startup"
+        print("[fso-zmq] %s at %.3f: gain index %d..%d (%d samples, %s)"
+              % (kind.upper(), now, first, last, n, phase))
+        if self._events:
+            self._events.write("%.6f,%s,%d,%d,%d,%s\n"
+                               % (now, kind, first, last, n, phase))
+
+    def _count_starve(self, n):
+        if self._started:
+            self.n_starve_inrun += 1
+            if self._ep_start is None:
+                self._ep_start = time.monotonic()
+        else:
+            self.n_starve_startup += 1
+        now = time.time()
+        if self.t_first_starve is None:
+            self.t_first_starve = now
+        self.t_last_starve = now
+        if self.t_first_msg is None:
+            self.n_starve_pre_first += 1
+
     # -- ingest ---------------------------------------------------------
     def _reset_buffer(self, gains, base_index):
         self.buf = np.asarray(gains, dtype=np.float64)
@@ -141,6 +235,10 @@ class GainStreamDecoder:
                                  "message")
             return None
         self.n_messages += 1
+        if self.t_first_msg is None:
+            self.t_first_msg = time.time()
+        self.latest_seq = msg["seq_start"] + msg["n"] - 1
+        self._diag_tick()
 
         # non-negativity on receipt: clamp + count (server guarantees >= 0,
         # so any negative is corruption, never silently used)
@@ -160,6 +258,10 @@ class GainStreamDecoder:
         # discrete trace switch: legitimate discontinuity, reset continuity
         if self.epoch is not None and msg["epoch"] != self.epoch:
             self.n_epoch_changes += 1
+            if self.buf.size:
+                self._event("epoch_reset", self.base_index,
+                            self.base_index + self.buf.size - 1,
+                            self.buf.size)
             self._reset_buffer(g, msg["seq_start"])
             self.epoch = msg["epoch"]
             self.expected_seq = msg["seq_start"] + msg["n"]
@@ -180,6 +282,7 @@ class GainStreamDecoder:
             lost = msg["seq_start"] - self.expected_seq
             self.n_gaps += 1
             self.n_lost_samples += int(lost)
+            self._event("gap", self.expected_seq, msg["seq_start"] - 1, lost)
             self._warn("gap", "[fso-zmq] sequence GAP: lost %d gain "
                              "samples (re-anchoring)" % lost)
             self._reset_buffer(g, msg["seq_start"])
@@ -205,9 +308,13 @@ class GainStreamDecoder:
             if n_out > 0:
                 self.n_starve_events += 1
                 self.n_starve_samples += n_out
+                self._count_starve(n_out)
+                self._diag_tick()
                 self._warn("starve", "[fso-zmq] STARVED: no gain data for "
                                     "%d signal samples (deferring)" % n_out)
             return np.empty(0, dtype=np.float64), n_out
+
+        self._bound_latency()
 
         # absolute (within-buffer) fractional positions of the n_out samples
         pos = self.cursor + np.arange(n_out) / self.R
@@ -220,11 +327,16 @@ class GainStreamDecoder:
             # cannot even cover the first sample -> fully starved this call
             self.n_starve_events += 1
             self.n_starve_samples += n_out
+            self._count_starve(n_out)
+            self._diag_tick()
             self._warn("starve", "[fso-zmq] STARVED: buffer cannot cover "
                                 "%d signal samples (deferring)" % n_out)
             return np.empty(0, dtype=np.float64), n_out
 
         gains = np.interp(pos[:k], np.arange(self.buf.size), self.buf)
+        self._log_frame_indices(k)
+        if not self._started:
+            self._started = True
 
         # advance the cursor and trim fully-consumed gain samples
         self.cursor += k / self.R
@@ -234,14 +346,55 @@ class GainStreamDecoder:
             self.base_index += drop
             self.cursor -= drop
 
+        self.n_signal_out += k
         shortfall = n_out - k
+        if shortfall == 0 and self._ep_start is not None:
+            self.starve_max_episode_s = max(self.starve_max_episode_s,
+                                            time.monotonic() - self._ep_start)
+            self._ep_start = None
         if shortfall > 0:
             self.n_starve_events += 1
             self.n_starve_samples += shortfall
+            self._count_starve(shortfall)
             self._warn("starve", "[fso-zmq] STARVED: covered %d/%d signal "
                                 "samples this call, deferring %d"
                                 % (k, n_out, shortfall))
+        self._diag_tick()
         return gains, shortfall
+
+    def _bound_latency(self):
+        """Drop stale backlog beyond RESYNC_FACTOR x LOOKAHEAD_S (oldest
+        first, keeping LOOKAHEAD_S buffered), as a counted, logged resync.
+        Also accumulates the delivery-latency statistics."""
+        ahead = self.buf.size - 1 - self.cursor     # gain samples ahead
+        if ahead > RESYNC_FACTOR * LOOKAHEAD_S * self.f_update:
+            drop = int(ahead - LOOKAHEAD_S * self.f_update)
+            self._event("resync", self.base_index,
+                        self.base_index + drop - 1, drop)
+            self.buf = self.buf[drop:]
+            self.base_index += drop
+            self.n_resync += 1
+            self.n_resync_samples += drop
+            ahead = self.buf.size - 1 - self.cursor
+        if self._started:                           # in-run latency only
+            lat = max(ahead, 0.0) / self.f_update
+            self.lat_max_s = max(self.lat_max_s, lat)
+            self._lat_sum += lat
+            self._lat_n += 1
+
+    def _log_frame_indices(self, k):
+        """Write the applied gain index at every frame boundary among the k
+        signal samples about to be produced (cursor not yet advanced)."""
+        if self._index is None:
+            return
+        n0 = self.n_signal_out
+        b = -(-n0 // FRAME_LEN) * FRAME_LEN         # first boundary >= n0
+        now = time.time()
+        while b < n0 + k:
+            g = self.base_index + self.cursor + (b - n0) / self.R
+            self._index.write("%d,%.4f,%.6f,%.6f\n"
+                              % (b // FRAME_LEN, g, self.f_update, now))
+            b += FRAME_LEN
 
     # -- logging (rate-limited so it is visible but never floods) -------
     def _warn(self, key, message):
@@ -250,13 +403,34 @@ class GainStreamDecoder:
             print(message)
             self._last_warn[key] = now
 
+    def close_logs(self):
+        for f in (self._events, self._index, self._diag):
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+        self._events = self._index = self._diag = None
+
     def summary(self):
         return dict(
             messages=self.n_messages, gaps=self.n_gaps,
             lost_samples=self.n_lost_samples,
             epoch_changes=self.n_epoch_changes, loops=self.n_loops,
             starve_events=self.n_starve_events,
+            starve_startup=self.n_starve_startup,
+            starve_inrun=self.n_starve_inrun,
+            starve_max_episode_s=round(self.starve_max_episode_s, 4),
+            resync_events=self.n_resync,
+            resync_samples=self.n_resync_samples,
+            latency_max_s=round(self.lat_max_s, 4),
+            latency_mean_s=round(self._lat_sum / self._lat_n, 4)
+            if self._lat_n else None,
             starve_samples=self.n_starve_samples,
+            starve_pre_first_msg=self.n_starve_pre_first,
+            first_msg_wall=self.t_first_msg,
+            first_starve_wall=self.t_first_starve,
+            last_starve_wall=self.t_last_starve,
             negative_clamped=self.n_negative_clamped)
 
 
@@ -319,6 +493,7 @@ try:
         def stop(self):
             s = self.decoder.summary()
             print("[fso-zmq] stream summary: %s" % s)
+            self.decoder.close_logs()
             try:
                 self._sock.close(0)
             except Exception:

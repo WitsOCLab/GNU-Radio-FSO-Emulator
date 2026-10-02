@@ -192,7 +192,7 @@ JSON over the REP socket (`tcp://127.0.0.1:50004`). Each request gets one reply.
 | `{"cmd":"set","param":"wind_speed","value":8.0}` | live wind [m/s], (0.5, 20]; pure time-resampling |
 | `{"cmd":"set","param":"attenuation","value":0.5}` | weather loss factor (0, 1] |
 | `{"cmd":"set","param":"gain_scale","value":2.0}` | overall gain multiplier (> 0) |
-| `{"cmd":"fade","depth_db":20,"duration_s":0.5}` | inject a deterministic deep fade (labelled, not turbulence) |
+| `{"cmd":"fade","depth_db":20,"duration_s":0.5}` | inject a deterministic deep fade (labelled, not turbulence); start the server with `--fade-log fades.csv` to record the absolute gain-index range each fade scaled |
 | `{"cmd":"ping"}` | liveness check |
 
 Wind above `v_max` (20 m/s) is clamped with a warning; published gain is always
@@ -225,8 +225,11 @@ Fixed link/grid constants live at the top of
   binds those ports.
 - **GUI won't start** — needs `PyQt5` + `pyqtgraph` and a display (`DISPLAY`
   set). The server and consumers run fine headless without it.
-- **`[fso-zmq] STARVED` in the GNU Radio block** — the consumer is pulling
-  faster than real time (e.g. no throttle/USRP pacing the flowgraph). Add a
-  throttle at the signal rate, or run against hardware.
+- **`[fso-zmq] STARVED` in the GNU Radio block** — short episodes (about one
+  20 ms publish tick, see `starve_max_episode_s` in the summary) are normal: a
+  throttle-paced flowgraph runs at the live edge of the stream and waits for
+  each update, with no value ever held. Long or continuous starvation means the
+  consumer is pulling faster than real time (e.g. no throttle/USRP pacing the
+  flowgraph). Add a throttle at the signal rate, or run against hardware.
 - **Only `weak` gives trustworthy numbers** — by design. See the validity
   envelope note in the README and `validation/`.

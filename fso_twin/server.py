@@ -22,6 +22,7 @@ Wire protocol: fso_stream_proto.py.
 
 import argparse
 import json
+import os
 import threading
 import time
 
@@ -49,6 +50,10 @@ CHEAP_SPEC = {
     "gain_scale":  dict(default=1.0, lo=0.0, hi=1e6, soft=10.0,
                         desc="overall gain scale multiplier (>0)"),
 }
+
+
+def _exists(path):
+    return os.path.exists(path)
 
 
 def loop_indices(progress, m, n, mode):
@@ -117,6 +122,12 @@ class ChannelServer:
         self.fade_factor = 1.0
         self.fade_depth_db = 0.0
         self.fade_until = 0.0          # time.monotonic() deadline
+        # Ground truth for fade alignment: every injected fade is recorded with
+        # the ABSOLUTE gain-sample index range it actually scaled (consumers
+        # align by index, never by wall clock).
+        self.fade_log_path = None
+        self.fade_records = []         # finished records (dicts)
+        self._fade_open = None         # record being filled by the publisher
         self.seq = 0
         self.trace_progress = 0
         self.loop_count = 0
@@ -164,12 +175,39 @@ class ChannelServer:
             raise ValueError("fade duration_s must be finite and > 0")
         d = min(d, 60.0)               # cap (10^-6 floor keeps gain > 0)
         with self.lock:
+            self._close_fade_record()          # a new fade ends any open one
             self.fade_depth_db = d
             self.fade_factor = 10.0 ** (-d / 10.0)
             self.fade_until = time.monotonic() + dur
+            self._fade_open = {"t_cmd_unix": time.time(), "depth_db": d,
+                               "duration_s": dur, "seq_first": None,
+                               "seq_last": None}
         if self.verbose:
             print("[server] INJECTED test fade: -%.1f dB for %.3f s" % (d, dur))
         return self.cmd_status()
+
+    def _close_fade_record(self):
+        """Finish the open fade record (call with self.lock held) and append it
+        to the fade log. A fade that scaled no samples is still recorded."""
+        rec = self._fade_open
+        if rec is None:
+            return
+        self._fade_open = None
+        self.fade_records.append(rec)
+        line = "%.6f,%g,%g,%s,%s" % (
+            rec["t_cmd_unix"], rec["depth_db"], rec["duration_s"],
+            "" if rec["seq_first"] is None else rec["seq_first"],
+            "" if rec["seq_last"] is None else rec["seq_last"])
+        if self.verbose:
+            print("[server] fade record: depth %.1f dB, %.3f s, gain seq %s..%s"
+                  % (rec["depth_db"], rec["duration_s"], rec["seq_first"],
+                     rec["seq_last"]))
+        if self.fade_log_path:
+            new = not _exists(self.fade_log_path)
+            with open(self.fade_log_path, "a") as f:
+                if new:
+                    f.write("t_cmd_unix,depth_db,duration_s,seq_first,seq_last\n")
+                f.write(line + "\n")
 
     def cmd_status(self):
         with self.lock:
@@ -196,6 +234,8 @@ class ChannelServer:
                 "fade_active": time.monotonic() < self.fade_until,
                 "fade_depth_db": self.fade_depth_db,
                 "fade_remaining_s": max(0.0, self.fade_until - time.monotonic()),
+                "fades_recorded": len(self.fade_records),
+                "seq_next": self.seq,
                 "cheap": dict(self.cheap.values),
             }
 
@@ -254,20 +294,34 @@ class ChannelServer:
             print("[server] gain PUB on %s" % GAIN_PUB_ENDPOINT)
         time.sleep(0.3)
         t0 = time.monotonic(); emitted = 0; cur_wind = self.wind_speed
+        cur_f = self.f_update_stored * (cur_wind / self.v_max)
         n = len(self.h)
         while self.running:
             now = time.monotonic()
             with self.lock:
                 mult = self.cheap.combined_multiplier()
-                if now < self.fade_until:              # injected deep test fade
+                fading = now < self.fade_until
+                if fading:                             # injected deep test fade
                     mult *= self.fade_factor
+                elif self._fade_open is not None and \
+                        self._fade_open["seq_first"] is not None:
+                    self._close_fade_record()          # fade over: log it
                 wind = self.wind_speed
                 f_eff = self.f_update_stored * (wind / self.v_max)
                 progress = self.trace_progress
                 seq = self.seq
                 trace_changed = self.pending_trace_changed
                 if wind != cur_wind:                   # re-baseline on rate change
-                    cur_wind = wind; t0 = now; emitted = 0
+                    # Carry over the lookahead ALREADY published (seconds ahead
+                    # of real time at the old rate) so the new rate only tops
+                    # it up to LOOKAHEAD_S. Restarting from emitted=0 re-sent a
+                    # full LOOKAHEAD_S on every wind command, and that surplus
+                    # accumulated as consumer latency (70k-185k samples over
+                    # the 15-min scenario).
+                    ahead_s = min(max(emitted / cur_f - (now - t0), 0.0),
+                                  LOOKAHEAD_S)
+                    cur_wind = wind; cur_f = f_eff; t0 = now
+                    emitted = int(round(ahead_s * f_eff))
                 due = int((now - t0 + LOOKAHEAD_S) * f_eff)
                 m = due - emitted
                 msg = None
@@ -282,6 +336,10 @@ class ChannelServer:
                                            trace_changed=trace_changed,
                                            looped=(n_seams > 0))
                         sent = idx.size
+                        if fading and self._fade_open is not None:
+                            if self._fade_open["seq_first"] is None:
+                                self._fade_open["seq_first"] = seq
+                            self._fade_open["seq_last"] = seq + sent - 1
                         self.seq = seq + sent
                         self.trace_progress = progress + sent
                         self.pending_trace_changed = False
@@ -304,6 +362,8 @@ class ChannelServer:
     def stop(self):
         self.running = False
         time.sleep(0.3)
+        with self.lock:
+            self._close_fade_record()
 
     def run(self):
         self.start()
@@ -340,9 +400,14 @@ def main():
                          "HELD-OUT seed when evaluating the GRU predictor -- "
                          "the training library used 20240+1000*regime+k, "
                          "k=0..7)" % DEFAULT_SEED)
+    ap.add_argument("--fade-log", default=None,
+                    help="CSV file to append one row per injected fade: "
+                         "command time, depth, duration and the absolute "
+                         "gain-sample index range it scaled")
     args = ap.parse_args()
     server = ChannelServer(scheme=args.scheme, loop_mode=args.loop_mode,
                            seed=args.seed)
+    server.fade_log_path = args.fade_log
     print(COMMANDS)
     print("[server] only 'weak' is Rytov-validated; moderate/strong are "
           "PHYSICALLY-PLAUSIBLE-BUT-UNVERIFIED.")
