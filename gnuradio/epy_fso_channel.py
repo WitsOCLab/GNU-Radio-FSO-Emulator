@@ -458,6 +458,11 @@ try:
             self._sock.setsockopt(zmq.SUBSCRIBE, b"")
             self._sock.setsockopt(zmq.LINGER, 0)
             self._endpoint = gain_endpoint
+            # read-only power meter (for SNR calibration against the AWGN
+            # added downstream): mean |x|^2 in and mean |h x|^2 out
+            self._p_in = 0.0
+            self._p_out = 0.0
+            self._p_n = 0
 
         def _drain(self):
             """Pull every currently-available gain message without blocking.
@@ -480,6 +485,10 @@ try:
 
             if k > 0:
                 out[:k] = (x[:k] * gains).astype(np.complex64)
+                xk = x[:k]
+                self._p_in += float(np.vdot(xk, xk).real)
+                self._p_out += float(np.vdot(out[:k], out[:k]).real)
+                self._p_n += k
 
             if k == 0:
                 # fully starved this call: produce nothing, do NOT hold. A
@@ -492,7 +501,10 @@ try:
 
         def stop(self):
             s = self.decoder.summary()
-            print("[fso-zmq] stream summary: %s" % s)
+            if self._p_n:
+                s["mean_power_in"] = self._p_in / self._p_n
+                s["mean_power_out"] = self._p_out / self._p_n
+            print("[fso-zmq] stream summary: %s" % s, flush=True)
             self.decoder.close_logs()
             try:
                 self._sock.close(0)

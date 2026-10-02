@@ -13,6 +13,7 @@ PYTHONPATH=../fso_twin python3 verify_screens.py
 PYTHONPATH=../fso_twin python3 verify_rytov.py
 PYTHONPATH=../fso_twin python3 verify_aperture.py
 PYTHONPATH=../fso_twin python3 verify_wind.py
+PYTHONPATH=../fso_twin python3 verify_latency.py
 PYTHONPATH=../fso_twin python3 sweep_strong.py --probe   # then --sweep
 ```
 
@@ -22,6 +23,7 @@ PYTHONPATH=../fso_twin python3 sweep_strong.py --probe   # then --sweep
 | `verify_rytov.py` | 2 | split-step scintillation vs Rytov variance (the hard gate) | within ~1 % for 5/10/20 screens; mean intensity preserved |
 | `verify_aperture.py` | 3 | aperture integration → scalar gain h | clear-air h = 1 exactly; aperture averaging as D grows |
 | `verify_wind.py` | 6 | live wind tuning = time-resampling (end-to-end ZMQ) | rate halves exactly; zero value difference; linear ≠ ZOH |
+| `verify_latency.py` | 6 | delivery latency under live wind changes (160 commands in 40 s) + injected fades, through the GNU Radio block's decoder | latency bounded (no growth), 0 resyncs / gaps, each fade applied exactly at its server-logged gain-index range |
 | `sweep_strong.py` + `gamma_gamma.py` | 7 | strong-regime split-step vs Gamma-Gamma theory | agreement to σ_R² ≈ 0.3, then a bounded departure (the validity envelope) |
 
 **Stage 4** (frozen-flow ergodicity) was verified against the retired multi-trace

@@ -25,13 +25,15 @@ cleanup() { echo; echo "[run_server] stopping..."
 trap cleanup INT TERM
 
 echo "[run_server] starting server (scheme=$SCHEME, seed=$SEED) on :50003/:50004..."
-( cd "$TWIN" && python3 server.py --scheme "$SCHEME" --seed "$SEED" ) &
+# exec: SERVER_PID must be the python process itself, so Ctrl+C really stops
+# it (otherwise only the subshell dies and the server keeps :50003/:50004)
+( cd "$TWIN" && exec python3 server.py --scheme "$SCHEME" --seed "$SEED" ) &
 SERVER_PID=$!
 sleep 1
 
 if [[ "$GUI" == "1" ]]; then
     echo "[run_server] starting control GUI..."
-    ( cd "$TWIN" && python3 control_gui.py ) &
+    ( cd "$TWIN" && exec python3 control_gui.py ) &
     GUI_PID=$!
 fi
 

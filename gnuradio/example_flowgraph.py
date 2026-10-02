@@ -48,8 +48,16 @@ def main():
     ap.add_argument("--out", default="out.cf32")
     args = ap.parse_args()
     tb = ExampleGraph(args.samp_rate, args.nsamples, args.out)
-    print("running... (needs the channel server on :50003)")
-    tb.run()
+    print("running... (needs the channel server on :50003; Ctrl+C stops cleanly)")
+    tb.start()
+    try:
+        tb.wait()
+    except KeyboardInterrupt:
+        pass
+    # graceful stop: the FSO block's stop() prints its stream summary and
+    # flushes its optional logs (FSO_INDEX_LOG / FSO_EVENT_LOG)
+    tb.stop()
+    tb.wait()
     print("done -> %s" % args.out)
 
 

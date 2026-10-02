@@ -15,8 +15,12 @@ starvation is counted and printed when the flowgraph stops.
 Latency is bounded: if more than 4 x the server lookahead (1 s) of gain is ever
 buffered, the oldest samples are dropped as a counted, logged **resync**. The
 shutdown summary reports gaps, lost samples, loops, starvation (start-up vs
-in-run, plus the longest in-run episode), resyncs, and max/mean delivery
-latency. Optional logs, enabled by environment variable:
+in-run, plus the longest in-run episode), resyncs, max/mean delivery
+latency, and the mean signal power into and out of the block
+(`mean_power_in` = mean |x|², `mean_power_out` = mean |h·x|²), which lets
+you calibrate SNR against any noise you add downstream. Stop the flowgraph
+gracefully (`tb.stop(); tb.wait()`, as `example_flowgraph.py` does on
+Ctrl+C) or the summary and logs are lost. Optional logs, enabled by environment variable:
 
 | Variable | Contents |
 |---|---|
